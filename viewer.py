@@ -74,14 +74,25 @@ def api_list_ontologies():
     for o in ontos:
         # Count facts if DB exists
         facts = 0
+        concepts = 0
         if os.path.exists(o["db_path"]):
             try:
                 db = pycozo.Client('sqlite', o["db_path"], dataframe=False)
-                res = db.run("?[n] := *eav[e,a,v,_,_,_], n = count(e,a,v)")
-                rows = res.get('rows', [])
-                facts = rows[0][0] if rows else 0
+                # Count relationships (facts) - Using head aggregator for compatibility
+                res_f = db.run("?[count(e)] := *eav[e,_,_,_,_,_]")
+                facts = res_f.get('rows', [[0]])[0][0] if res_f.get('rows') else 0
+                
+                # Count unique concepts - Using multi-stage head aggregator
+                res_c = db.run("c[v] := *eav[v,_,_,_,_,_] c[v] := *eav[_,_,v,_,_,_] ?[count(v)] := c[v]")
+                concepts = res_c.get('rows', [[0]])[0][0] if res_c.get('rows') else 0
+                
+                # Count grounded concepts (those in concept_metadata)
+                res_g = db.run("?[count(c)] := *concept_metadata[c, _]")
+                grounded = res_g.get('rows', [[0]])[0][0] if res_g.get('rows') else 0
             except Exception:
                 facts = 0
+                concepts = 0
+                grounded = 0
 
         workers_status = {}
         for wname in WORKER_SCRIPTS:
@@ -91,7 +102,7 @@ def api_list_ontologies():
             else:
                 workers_status[wname] = "stopped"
 
-        result.append({**o, "facts": facts, "workers": workers_status})
+        result.append({**o, "facts": facts, "concepts": concepts, "grounded": grounded, "workers": workers_status})
     return jsonify(result)
 
 

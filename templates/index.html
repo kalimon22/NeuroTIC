@@ -138,7 +138,10 @@
         .btn-refresh { padding:7px 16px; background:rgba(56,189,248,0.1); border:1px solid rgba(56,189,248,0.3); color:#38bdf8; border-radius:8px; font-family:inherit; font-size:0.8rem; cursor:pointer; transition:all 0.2s; margin-bottom:18px; }
         .btn-refresh:hover { background:rgba(56,189,248,0.2); }
         .empty-state { text-align:center; padding:40px; color:#475569; font-style:italic; }
-        .active-onto-tag { display:inline-block; font-size:0.68rem; font-weight:600; text-transform:uppercase; letter-spacing:0.8px; padding:2px 8px; border-radius:10px; background:rgba(56,189,248,0.15); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); margin-left:6px; vertical-align:middle; }
+        .active_onto-tag { display:inline-block; font-size:0.68rem; font-weight:600; text-transform:uppercase; letter-spacing:0.8px; padding:2px 8px; border-radius:10px; background:rgba(56,189,248,0.15); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); margin-left:6px; vertical-align:middle; }
+        .onto-card-badges { position:absolute; top:18px; right:18px; display:flex; flex-direction:column; gap:6px; align-items:flex-end; }
+        .badge-stat { font-size:0.68rem; padding:3px 10px; border-radius:12px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:#94a3b8; white-space:nowrap; }
+        .badge-stat b { color:#e2e8f0; margin-right:2px; }
 
         ::-webkit-scrollbar { width:5px; }
         ::-webkit-scrollbar-track { background:transparent; }
@@ -365,12 +368,16 @@ function renderOntoCard(o) {
 
     const slug = o.name.replace(/\s/g,'_');
     return `<div class="onto-card ${isActive ? 'active-card' : ''}" id="onto-card-${slug}">
+        <div class="onto-card-badges">
+            <span class="badge-stat"><b>${o.concepts ?? 0}</b> conceptos</span>
+            <span class="badge-stat"><b>${o.facts ?? 0}</b> relaciones</span>
+            <span class="badge-stat"><b>${o.grounded ?? 0}</b> grounded</span>
+        </div>
         ${isActive ? '<span class="active-onto-tag">activa</span>' : ''}
         <div class="onto-card-title">${o.name}</div>
         <span class="onto-card-mode ${modeClass}">${modeLabel}</span>
         <div class="onto-card-info">${o.description || (o.mode==='seed' ? '🌱 Semilla: <b>' + o.seed + '</b>' : 'Extracción desde archivos')}</div>
         <div class="onto-card-stats">
-            <span class="onto-stat"><strong>${o.facts ?? '?'}</strong> hechos</span>
             <span class="onto-stat">creada ${(o.created_at||'').slice(0,10)}</span>
         </div>
         <div class="onto-model-select-row">
@@ -508,9 +515,11 @@ function showSuggestions(input, resultsId) {
 }
 
 function selectSuggestion(resultsId, val) {
-    const inputId = resultsId.replace('Results', '');
+    let inputId = resultsId.replace('Results', '');
+    if (resultsId === 'searchResults') inputId = 'searchInput';
+    
     const input = document.getElementById(inputId);
-    input.value = val;
+    if (input) input.value = val;
     document.getElementById(resultsId).style.display = 'none';
     
     if (inputId === 'searchInput') {
@@ -547,8 +556,10 @@ async function loadRoots() {
 // ── EXPLORER ──────────────────────────────────────────────────
 async function exploreNode(conceptStr) {
     switchTab('explorer');
-    searchResults.style.display = 'none';
-    searchInput.value = '';
+    const sr = document.getElementById('searchResults');
+    const si = document.getElementById('searchInput');
+    if (sr) sr.style.display = 'none';
+    if (si) si.value = '';
     const panel = document.getElementById('panel-explorer');
     panel.innerHTML = `<div style="color:#64748b; padding:20px; font-style:italic;">Cargando <b>${conceptStr}</b>...</div>`;
     if (!currentOnto) { panel.innerHTML = '<div style="color:#ef4444; padding:20px;">Selecciona una ontología primero.</div>'; return; }

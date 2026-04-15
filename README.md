@@ -2,7 +2,6 @@
 
 **NeuroTIC** is an autonomous, multi-agent ontology engine designed to map, explore, and expand complex knowledge domains. It uses a combination of Graph Databases (CozoDB), Large Language Models (via Ollama), and a dual-agent architecture to build deeply interconnected knowledge graphs from a single seed concept or provided source files.
 
-![Preview of Relationships Tab](https://via.placeholder.com/800x400?text=NeuroTIC+Interface+Preview)
 
 ## 🚀 Key Features
 
