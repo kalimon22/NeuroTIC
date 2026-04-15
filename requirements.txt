@@ -1,0 +1,5 @@
+pycozo[embedded]
+requests>=2.31.0
+pandas
+flask
+pymupdf
