@@ -6,6 +6,7 @@ import os
 import json
 import shutil
 from datetime import datetime
+from wiki_utils import WikiManager
 
 REGISTRY_PATH = os.environ.get("REGISTRY_PATH", "data/ontologies/registry.json")
 
@@ -57,6 +58,9 @@ def create_ontology(name: str, mode: str, seed: str = "", description: str = "")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(done_dir, exist_ok=True)
 
+    # Initialize Wiki structure
+    WikiManager(base_dir)
+
     entry = {
         "name": name,
         "slug": slug,
@@ -66,6 +70,7 @@ def create_ontology(name: str, mode: str, seed: str = "", description: str = "")
         "db_path": db_path,
         "input_dir": input_dir,
         "done_dir": done_dir,
+        "wiki_dir": f"{base_dir}/wiki",
         "created_at": datetime.utcnow().isoformat()
     }
 

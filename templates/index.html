@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NeuroTIC Ontological Explorer</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; }
@@ -218,7 +219,7 @@
         </div>
 
         <!-- Hidden file upload for files mode -->
-        <input type="file" id="fileUploadInput" multiple accept=".txt,.pdf" onchange="handleFileUpload()">
+        <input type="file" id="fileUploadInput" multiple accept=".txt,.md,.pdf" onchange="handleFileUpload()">
     </div>
 
     <!-- ── EXPLORER ── -->
@@ -235,6 +236,11 @@
         <!-- Model + input row -->
         <div style="display:flex; gap:8px; margin-bottom:14px; align-items:center; flex-wrap:wrap;">
             <select id="modelSelector" class="form-input form-select" style="width:220px; flex-shrink:0; padding:10px 13px;" title="Modelo Ollama a usar para esta pregunta"></select>
+            <select id="qaModeSelector" class="form-input form-select" style="width:180px; flex-shrink:0; padding:10px 13px;">
+                <option value="hybrid" selected>🧠 Modo Híbrido (Wiki + Grafo)</option>
+                <option value="datalog">📊 Modo Datalog (Grafo)</option>
+                <option value="wiki">📖 Modo Wiki (Markdown)</option>
+            </select>
             <button class="btn-refresh" style="margin:0;" onclick="loadModels()">↻ Modelos</button>
         </div>
         <div class="qa-input-row">
@@ -282,6 +288,7 @@
 let currentOnto = null;  // Active ontology name
 let allEntities = [];
 let uploadTarget = null; // Which onto to upload files to
+window.persistedModels = JSON.parse(localStorage.getItem('neurotic_selected_models') || '{}');
 
 // ── TAB SWITCHING ─────────────────────────────────────────────
 function switchTab(name) {
@@ -353,10 +360,11 @@ function renderOntoCard(o) {
         : ['file-extractor', 'grounding-engine', 'reviewer'];
 
     const workersHtml = workerNames.map(wn => {
-        const status = (o.workers || {})[wn] || 'stopped';
-        const running = status === 'running';
+        const info = (o.workers || {})[wn] || {status: 'stopped'};
+        const running = info.status === 'running';
+        const modelLabel = running && info.model ? `<span style="font-size:0.6rem; color:#64748b; margin-left:4px;">(${info.model})</span>` : '';
         return `<div class="worker-row">
-            <span class="worker-name"><span class="worker-dot ${running ? 'dot-running' : 'dot-stopped'}"></span>${wn}</span>
+            <span class="worker-name"><span class="worker-dot ${running ? 'dot-running' : 'dot-stopped'}"></span>${wn}${modelLabel}</span>
             <button class="worker-toggle ${running ? 'wt-stop' : 'wt-start'}"
                 onclick="toggleWorker('${o.name}','${wn}','${running ? 'stop' : 'start'}')"
             >${running ? 'Stop' : 'Start'}</button>
@@ -382,8 +390,11 @@ function renderOntoCard(o) {
         </div>
         <div class="onto-model-select-row">
             <label style="font-size:0.65rem; margin-bottom:2px;">Modelo para workers:</label>
-            <select class="onto-model-select" id="model-select-${slug}">
-                ${(window.ollamaModels || []).map(m => `<option value="${m}">${m}</option>`).join('')}
+            <select class="onto-model-select" id="model-select-${slug}" onchange="saveModelSelection('${o.name}', this.value)">
+                ${(window.ollamaModels || []).map(m => {
+                    const selected = window.persistedModels[o.name] === m ? 'selected' : '';
+                    return `<option value="${m}" ${selected}>${m}</option>`;
+                }).join('')}
             </select>
         </div>
         <div class="workers-grid">${workersHtml}</div>
@@ -454,6 +465,10 @@ async function toggleWorker(ontoName, workerName, action) {
         const modelSelect = document.getElementById(`model-select-${slug}`);
         const model = modelSelect ? modelSelect.value : null;
 
+        if (action === 'start' && model) {
+            saveModelSelection(ontoName, model);
+        }
+
         const res = await fetch(`/api/ontologies/${encodeURIComponent(ontoName)}/workers/${encodeURIComponent(workerName)}`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -465,6 +480,11 @@ async function toggleWorker(ontoName, workerName, action) {
             loadOntoManager();
         } else { alert('Error: ' + r.msg); }
     } catch(e) { alert('Error de red.'); }
+}
+
+function saveModelSelection(ontoName, model) {
+    window.persistedModels[ontoName] = model;
+    localStorage.setItem('neurotic_selected_models', JSON.stringify(window.persistedModels));
 }
 
 // ── FILE UPLOAD ───────────────────────────────────────────────
@@ -575,11 +595,14 @@ async function exploreNode(conceptStr) {
                 </h2>
                 <span class="tag" style="background:#0f172a; border:1px solid #334155; color:#94a3b8; font-size:0.76rem; padding:4px 10px;">${data.outgoing.length + data.incoming.length} enlaces · <b style="color:#38bdf8;">${currentOnto}</b></span>
             </div>
-            ${data.description
-                ? `<div style="background:rgba(56,189,248,0.05); border:1px solid rgba(56,189,248,0.2); border-left:4px solid #38bdf8; padding:13px 17px; border-radius:8px; margin-bottom:24px; line-height:1.6; color:#e2e8f0; font-size:0.9rem;"><i>" ${data.description} "</i></div>`
-                : `<div style="color:#64748b; font-size:0.85rem; margin-bottom:20px;">Esperando metadatos del agente de grounding...</div>`}
+            ${data.markdown 
+                ? `<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:20px; border-radius:12px; margin-bottom:24px; line-height:1.7; color:#f1f5f9; font-size:0.95rem;" class="markdown-body">${marked.parse(data.markdown)}</div>`
+                : (data.description 
+                    ? `<div style="background:rgba(56,189,248,0.05); border:1px solid rgba(56,189,248,0.2); border-left:4px solid #38bdf8; padding:13px 17px; border-radius:8px; margin-bottom:24px; line-height:1.6; color:#e2e8f0; font-size:0.9rem;"><i>" ${data.description} "</i></div>`
+                    : `<div style="color:#64748b; font-size:0.85rem; margin-bottom:20px;">Esperando contenido del Wiki...</div>`)
+            }
             <div class="table-section">
-                <div class="table-header">Relaciones salientes <span>${data.outgoing.length}</span></div>
+                <div class="table-header">Relaciones estructuradas (Grafo) <span>${data.outgoing.length}</span></div>
                 <div>${data.outgoing.length === 0 ? '<div class="data-row" style="color:#64748b;">Sin relaciones.</div>' : ''}
                 ${data.outgoing.map(r => renderRow(r.attribute, r.target, r.is_bind, r.confidence, r.source)).join('')}</div>
             </div>
@@ -635,20 +658,22 @@ async function sendQuestion() {
     const btn = document.getElementById('qaSendBtn');
     const thinking = document.getElementById('qaThinking');
     const selectedModel = document.getElementById('modelSelector').value || null;
+    const qaMode = document.getElementById('qaModeSelector').value;
     btn.disabled = true; thinking.style.display = 'block'; input.value = '';
     try {
         const res = await fetch('/api/ask', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ question, onto: currentOnto, model: selectedModel })
+            body: JSON.stringify({ question, onto: currentOnto, model: selectedModel, mode: qaMode })
         });
         const data = await res.json();
         const errNote = data.query_error ? `<div style="margin-top:6px;color:#fca5a5;font-size:0.78rem;">⚠ ${data.query_error}</div>` : '';
 
         // Always show the generated Datalog query
-        const queryBlock = data.generated_query
+        const q_text = data.query || data.generated_query;
+        const queryBlock = q_text
             ? `<div style="margin-top:12px;">
                 <div style="font-size:0.72rem; font-weight:700; text-transform:uppercase; letter-spacing:0.8px; color:#64748b; margin-bottom:5px;">🔍 Consulta Datalog generada</div>
-                <code style="display:block; padding:10px 13px; background:#0a0f1e; border:1px solid rgba(56,189,248,0.15); border-radius:8px; font-size:0.82rem; color:#7dd3fc; white-space:pre-wrap; word-break:break-all; line-height:1.5;">${data.generated_query}</code>
+                <code style="display:block; padding:10px 13px; background:#0a0f1e; border:1px solid rgba(56,189,248,0.15); border-radius:8px; font-size:0.82rem; color:#7dd3fc; white-space:pre-wrap; word-break:break-all; line-height:1.5;">${q_text}</code>
                </div>` : '';
 
         const rawBlock = data.raw_results && data.raw_results.length
@@ -657,12 +682,13 @@ async function sendQuestion() {
 
         const card = document.createElement('div');
         card.className = 'qa-answer-box';
+        const formattedAnswer = data.answer ? marked.parse(data.answer) : '<em style="color:#64748b">Sin respuesta.</em>';
         card.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
-                <div style="font-size:0.76rem; color:#64748b;">❓ ${data.question}</div>
+                <div style="font-size:0.76rem; color:#64748b;">❓ ${data.question || question}</div>
                 <span style="font-size:0.7rem; background:rgba(129,140,248,0.15); border:1px solid rgba(129,140,248,0.3); color:#a5b4fc; padding:2px 8px; border-radius:10px;">🤖 ${data.model_used || selectedModel || 'default'}</span>
             </div>
-            <div style="line-height:1.7;">${data.answer || '<em style="color:#64748b">Sin respuesta.</em>'}</div>
+            <div style="line-height:1.7;" class="markdown-body">${formattedAnswer}</div>
             ${errNote}
             ${queryBlock}
             ${rawBlock}`;

@@ -11,6 +11,7 @@ import uuid
 import logging
 import requests
 import pycozo
+from db_utils import run_query, setup_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [REVIEWER] - %(message)s")
 
@@ -21,12 +22,13 @@ BATCH_SIZE   = int(os.environ.get("REVIEW_BATCH_SIZE", "10"))
 SLEEP_SECS   = int(os.environ.get("REVIEW_SLEEP", "30"))
 DB_PATH      = os.environ.get("DB_PATH", "data/ontology.db")
 
-REVIEW_PROMPT = """You are a data quality expert for a physics ontology knowledge graph.
+REVIEW_PROMPT = """You are a data quality expert for a legal and documentary knowledge graph.
 You will receive a list of EAV (Entity, Attribute, Value) facts from the database.
-Your task: identify facts that have obvious issues such as:
-- Spelling mistakes in entity or value names (e.g. "Gravvedad" should be "Gravedad")
-- Attribute names inconsistent with the vocabulary: afecta_a, generado_por, compuesto_por, propuesto_por, es_un, requiere_de, es_instancia_de, afecta_indirectamente_a
-- Clearly wrong relationships
+Your tasks:
+1. NORMALIZATION: Fix spelling mistakes and capitalization. Crucially, remove leading articles like 'El', 'La', 'Los', 'Las', 'Un', 'Una' from concepts to prevent duplication (e.g. "La Junta De Castilla y Leon" MUST become "Junta De Castilla Y Leon").
+2. Ensure Attribute names are strictly from this list: afecta_a, generado_por, compuesto_por, propuesto_por, es_un, requiere_de, es_instancia_de, afecta_indirectamente_a, regula, prohibe, permite, establece.
+3. GROUNDING: If an Entity or Value is extremely generic (e.g. "Ley", "Cortes", "Decreto", "Artículo") and lacks context, append the source filename from the (source=...) to it so it makes sense (e.g., "Ley" -> "Ley (BOCL-...)").
+4. PURGING: If a fact is completely useless noise, broken, or has no logical sense (e.g. "El presente" -> "afecta_a" -> "Lo dispuesto"), you MUST set new_entity to the exact word "DELETE".
 
 For each fix, output a JSON object. Output ONLY a JSON array of fixes (empty [] if all looks fine).
 Each fix must have: old_entity, old_attr, old_val, new_entity, new_attr, new_val, reason.
@@ -39,7 +41,7 @@ Respond with ONLY the JSON array, no other text."""
 
 def setup_pending_table(db):
     try:
-        db.run(":create pending_review {id: String => old_entity: String, old_attr: String, old_val: String, new_entity: String, new_attr: String, new_val: String, reason: String}")
+        run_query(db, ":create pending_review {id: String => old_entity: String, old_attr: String, old_val: String, new_entity: String, new_attr: String, new_val: String, reason: String}")
         logging.info("Tabla pending_review creada.")
     except Exception as e:
         if "conflicts with an existing one" not in str(e):
@@ -47,7 +49,7 @@ def setup_pending_table(db):
 
     # reviewed_facts tracks which EAV triplets have already been reviewed
     try:
-        db.run(":create reviewed_fact {entity: String, attribute: String, value: String}")
+        run_query(db, ":create reviewed_fact {entity: String, attribute: String, value: String}")
         logging.info("Tabla reviewed_fact creada.")
     except Exception as e:
         if "conflicts with an existing one" not in str(e):
@@ -65,7 +67,7 @@ def get_unreviewed_batch(db, batch_size):
     :limit $n
     """
     try:
-        res = db.run(query, {"n": batch_size})
+        res = run_query(db, query, {"n": batch_size})
         return res.get('rows', [])
     except Exception as ex:
         logging.error(f"Error obteniendo batch: {ex}")
@@ -99,7 +101,7 @@ def mark_reviewed(db, facts_list):
     """Mark facts as reviewed so we don't process them again."""
     data = [[r[0], r[1], r[2]] for r in facts_list]
     try:
-        db.run("?[entity, attribute, value] <- $data\n:put reviewed_fact {entity, attribute, value}", {"data": data})
+        run_query(db, "?[entity, attribute, value] <- $data\n:put reviewed_fact {entity, attribute, value}", {"data": data})
     except Exception as ex:
         logging.error(f"Error marcando como revisados: {ex}")
 
@@ -107,11 +109,15 @@ def mark_reviewed(db, facts_list):
 def apply_fix_auto(db, fix):
     """Apply a fix directly to the eav table."""
     try:
-        db.run("?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}",
+        run_query(db, "?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}",
                {"data": [[fix['old_entity'], fix['old_attr'], fix['old_val']]]})
-        db.run("?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}",
-               {"data": [[fix['new_entity'], fix['new_attr'], fix['new_val'], 1.0, 'llm_reviewer', False]]})
-        logging.info(f"[AUTO] Corregido: [{fix['old_entity']}, {fix['old_attr']}, {fix['old_val']}] → [{fix['new_entity']}, {fix['new_attr']}, {fix['new_val']}]")
+        
+        if fix['new_entity'] == "DELETE":
+            logging.info(f"[AUTO] Borrado (DELETE): [{fix['old_entity']}, {fix['old_attr']}, {fix['old_val']}] - Razón: {fix.get('reason', '')}")
+        else:
+            run_query(db, "?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}",
+                   {"data": [[fix['new_entity'], fix['new_attr'], fix['new_val'], 1.0, 'llm_reviewer', False]]})
+            logging.info(f"[AUTO] Corregido: [{fix['old_entity']}, {fix['old_attr']}, {fix['old_val']}] → [{fix['new_entity']}, {fix['new_attr']}, {fix['new_val']}]")
     except Exception as ex:
         logging.error(f"Error aplicando fix auto: {ex}")
 
@@ -120,7 +126,7 @@ def store_fix_pending(db, fix):
     """Store a fix in pending_review for human approval."""
     review_id = str(uuid.uuid4())
     try:
-        db.run(
+        run_query(db, 
             "?[id, old_entity, old_attr, old_val, new_entity, new_attr, new_val, reason] <- $data\n"
             ":put pending_review {id => old_entity, old_attr, old_val, new_entity, new_attr, new_val, reason}",
             {"data": [[
@@ -143,14 +149,7 @@ def main():
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
     db = pycozo.Client('sqlite', db_path, dataframe=False)
 
-    # Wait for main.py to create the base tables
-    while True:
-        try:
-            db.run("?[c] := *eav[c, _, _, _, _, _] :limit 1")
-            break
-        except Exception:
-            logging.info("Esperando a que se creen las tablas base...")
-            time.sleep(5)
+    setup_db(db)
 
     setup_pending_table(db)
 

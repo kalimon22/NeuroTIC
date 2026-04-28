@@ -4,20 +4,24 @@ Gestiona múltiples ontologías aisladas y sus workers desde la web.
 """
 import os
 import sys
+import re
 import json
 import signal
 import subprocess
 import collections
 import requests
 import logging
+import subprocess
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request
 
 import pycozo
+from db_utils import setup_db, run_query
 from ontology_manager import (
     load_registry, list_ontologies, get_ontology,
     create_ontology, delete_ontology
 )
+from wiki_utils import WikiManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [VIEWER] - %(message)s")
 
@@ -75,19 +79,20 @@ def api_list_ontologies():
         # Count facts if DB exists
         facts = 0
         concepts = 0
+        grounded = 0
         if os.path.exists(o["db_path"]):
             try:
-                db = pycozo.Client('sqlite', o["db_path"], dataframe=False)
+                db = get_db(o["name"])
                 # Count relationships (facts) - Using head aggregator for compatibility
-                res_f = db.run("?[count(e)] := *eav[e,_,_,_,_,_]")
+                res_f = run_query(db, "?[count(e)] := *eav[e,_,_,_,_,_]")
                 facts = res_f.get('rows', [[0]])[0][0] if res_f.get('rows') else 0
                 
                 # Count unique concepts - Using multi-stage head aggregator
-                res_c = db.run("c[v] := *eav[v,_,_,_,_,_] c[v] := *eav[_,_,v,_,_,_] ?[count(v)] := c[v]")
+                res_c = run_query(db, "c[v] := *eav[v,_,_,_,_,_] c[v] := *eav[_,_,v,_,_,_] ?[count(v)] := c[v]")
                 concepts = res_c.get('rows', [[0]])[0][0] if res_c.get('rows') else 0
                 
                 # Count grounded concepts (those in concept_metadata)
-                res_g = db.run("?[count(c)] := *concept_metadata[c, _]")
+                res_g = run_query(db, "?[count(c)] := *concept_metadata[c, _]")
                 grounded = res_g.get('rows', [[0]])[0][0] if res_g.get('rows') else 0
             except Exception:
                 facts = 0
@@ -96,11 +101,15 @@ def api_list_ontologies():
 
         workers_status = {}
         for wname in WORKER_SCRIPTS:
-            proc = running_workers.get(o["name"], {}).get(wname)
-            if proc is not None:
-                workers_status[wname] = "running" if proc.poll() is None else "stopped"
+            worker_info = running_workers.get(o["name"], {}).get(wname)
+            if worker_info is not None:
+                proc = worker_info["proc"]
+                if proc.poll() is None:
+                    workers_status[wname] = {"status": "running", "model": worker_info["model"]}
+                else:
+                    workers_status[wname] = {"status": "stopped"}
             else:
-                workers_status[wname] = "stopped"
+                workers_status[wname] = {"status": "stopped"}
 
         result.append({**o, "facts": facts, "concepts": concepts, "grounded": grounded, "workers": workers_status})
     return jsonify(result)
@@ -155,9 +164,10 @@ def _build_worker_env(onto: dict, worker_name: str, model: str | None = None) ->
         env["REVIEW_MODE"]     = env.get("REVIEW_MODE", "pending")
         env["REVIEW_BATCH_SIZE"] = "10"
         env["REVIEW_SLEEP"]    = "60"
-    if worker_name == "file-extractor":
+    if worker_name in ("file-extractor", "grounding-engine"):
         env["EXTRACTOR_INPUT_DIR"] = onto["input_dir"]
         env["EXTRACTOR_DONE_DIR"]  = onto["done_dir"]
+    if worker_name == "file-extractor":
         env["EXTRACTOR_CHUNK_SIZE"] = "1500"
     return env
 
@@ -170,7 +180,8 @@ def _get_worker_log_path(onto_name: str, worker_name: str) -> str:
 
 
 def _stop_all_workers(onto_name: str):
-    for wname, proc in list(running_workers.get(onto_name, {}).items()):
+    for wname, worker_info in list(running_workers.get(onto_name, {}).items()):
+        proc = worker_info["proc"]
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
@@ -188,11 +199,15 @@ def api_worker_status(name):
         return jsonify({"status": "error", "msg": "Ontología no encontrada."})
     result = {}
     for wname in WORKER_SCRIPTS:
-        proc = running_workers.get(name, {}).get(wname)
-        if proc is not None and proc.poll() is None:
-            result[wname] = "running"
+        worker_info = running_workers.get(name, {}).get(wname)
+        if worker_info is not None:
+            proc = worker_info["proc"]
+            if proc.poll() is None:
+                result[wname] = {"status": "running", "model": worker_info["model"]}
+            else:
+                result[wname] = {"status": "stopped"}
         else:
-            result[wname] = "stopped"
+            result[wname] = {"status": "stopped"}
     return jsonify(result)
 
 
@@ -216,34 +231,40 @@ def api_worker_action(name, worker):
 
     if action == "start":
         # Stop previous instance if any
-        existing = running_workers.get(name, {}).get(worker)
-        if existing and existing.poll() is None:
+        worker_info = running_workers.get(name, {}).get(worker)
+        if worker_info and worker_info["proc"].poll() is None:
             return jsonify({"status": "already_running"})
 
         script = WORKER_SCRIPTS[worker]
-        env = _build_worker_env(onto, worker, model=model)
+        used_model = model or OLLAMA_MODEL
+        env = _build_worker_env(onto, worker, model=used_model)
         log_path = _get_worker_log_path(name, worker)
         
         # Open log file in append mode
         log_file = open(log_path, "a", encoding="utf-8")
         
         # Use creationflags to detach on windows if needed, but for now just redirect
+        # Redirecting to sys.stderr so it appears in the Docker console log
         proc = subprocess.Popen(
             [sys.executable, f"/app/{script}"],
             env=env,
-            stdout=log_file,
-            stderr=log_file,
+            stdout=sys.stdout, 
+            stderr=sys.stderr,
+             # bufsize=0 is unbuffered
+            bufsize=0
         )
-        running_workers.setdefault(name, {})[worker] = proc
-        logging.info(f"[WORKER] Iniciado {worker} para '{name}' (PID {proc.pid})")
+        running_workers.setdefault(name, {})[worker] = {"proc": proc, "model": used_model}
+        logging.info(f"[WORKER] Iniciado {worker} para '{name}' con modelo {used_model} (PID {proc.pid})")
         return jsonify({"status": "ok", "action": "started", "pid": proc.pid})
 
     elif action == "stop":
-        proc = running_workers.get(name, {}).get(worker)
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try: proc.wait(timeout=5)
-            except Exception: proc.kill()
+        worker_info = running_workers.get(name, {}).get(worker)
+        if worker_info:
+            proc = worker_info["proc"]
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except Exception: proc.kill()
         running_workers.get(name, {}).pop(worker, None)
         logging.info(f"[WORKER] Detenido {worker} para '{name}'")
         return jsonify({"status": "ok", "action": "stopped"})
@@ -270,7 +291,7 @@ def api_upload_file(name):
         if f.filename == '':
             continue
         ext = os.path.splitext(f.filename)[1].lower()
-        if ext not in ('.txt', '.pdf'):
+        if ext not in ('.txt', '.md', '.pdf'):
             continue
         dest = os.path.join(onto["input_dir"], f.filename)
         f.save(dest)
@@ -289,7 +310,8 @@ def api_entities():
     onto_name = _get_onto_name_from_request()
     try:
         db = get_db(onto_name)
-        res = db.run("?[e] := *eav[e, _, _, _, _, _]")
+        query = "c[v] := *eav[v,_,_,_,_,_] c[v] := *eav[_,_,v,_,_,_] c[v] := *concept_metadata[v, _] ?[v] := c[v]"
+        res = run_query(db, query)
         entities = set(r[0] for r in res.get('rows', []))
         return jsonify(list(entities))
     except Exception:
@@ -301,7 +323,7 @@ def api_roots():
     onto_name = _get_onto_name_from_request()
     try:
         db = get_db(onto_name)
-        res = db.run("?[e, a, v] := *eav[e, a, v, _, _, _]")
+        res = run_query(db, "?[e, a, v] := *eav[e, a, v, _, _, _]")
         rows = res.get('rows', [])
         counter = collections.Counter(r[0] for r in rows)
         top = counter.most_common(20)
@@ -316,15 +338,25 @@ def api_node(concept):
     try:
         db = get_db(onto_name)
         c_safe = concept.replace("'", "")
-        out_res = db.run(f"?[a, v, c, s, b] := *eav[ent, a, v, c, s, b], ent = '{c_safe}'").get('rows', [])
-        in_res  = db.run(f"?[e, a, c, s, b] := *eav[e, a, val, c, s, b], val = '{c_safe}'").get('rows', [])
+        out_res = run_query(db, f"?[a, v, c, s, b] := *eav[ent, a, v, c, s, b], ent = '{c_safe}'").get('rows', [])
+        in_res  = run_query(db, f"?[e, a, c, s, b] := *eav[e, a, val, c, s, b], val = '{c_safe}'").get('rows', [])
         try:
-            meta_res = db.run(f"?[d] := *concept_metadata['{c_safe}', d]").get('rows', [])
+            meta_res = run_query(db, f"?[d] := *concept_metadata['{c_safe}', d]").get('rows', [])
             description = meta_res[0][0] if meta_res else ""
         except Exception:
             description = ""
+            
+        # ── WIKI CONTENT ──────────────────────────────────
+        wiki_content = ""
+        onto = get_ontology(onto_name)
+        if onto:
+            base_dir = os.path.dirname(onto["db_path"])
+            wm = WikiManager(base_dir)
+            wiki_content, _ = wm.read_page(concept)
+            
         return jsonify({
             "concept": concept, "description": description,
+            "markdown": wiki_content,
             "outgoing": [{"attribute": r[0], "target": r[1], "confidence": r[2], "source": r[3], "is_bind": r[4]} for r in out_res],
             "incoming": [{"source": r[0], "attribute": r[1], "confidence": r[2], "meta_source": r[3], "is_bind": r[4]} for r in in_res]
         })
@@ -343,8 +375,8 @@ def api_rename():
             return jsonify({"status": "error", "msg": "Nombres inválidos."})
         db = get_db(onto_name)
         c_old = old_name.replace("'", "")
-        out_rows = db.run(f"?[a, v, c, s, b] := *eav[ent, a, v, c, s, b], ent = '{c_old}'").get('rows', [])
-        in_rows  = db.run(f"?[e, a, c, s, b] := *eav[e, a, val, c, s, b], val = '{c_old}'").get('rows', [])
+        out_rows = run_query(db, f"?[a, v, c, s, b] := *eav[ent, a, v, c, s, b], ent = '{c_old}'").get('rows', [])
+        in_rows  = run_query(db, f"?[e, a, c, s, b] := *eav[e, a, val, c, s, b], val = '{c_old}'").get('rows', [])
         rm_keys, put_rows = [], []
         for r in out_rows:
             rm_keys.append([c_old, r[0], r[1]])
@@ -353,44 +385,50 @@ def api_rename():
             rm_keys.append([r[0], r[1], c_old])
             put_rows.append([r[0], r[1], new_name, r[2], r[3], r[4]])
         if rm_keys:
-            db.run("?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}", {"data": rm_keys})
+            run_query(db, "?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}", {"data": rm_keys})
         if put_rows:
-            db.run("?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}", {"data": put_rows})
-        meta_rows = db.run(f"?[c, d] := *concept_metadata['{c_old}', d]").get('rows', [])
+            run_query(db, "?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}", {"data": put_rows})
+        meta_rows = run_query(db, f"?[c, d] := *concept_metadata['{c_old}', d]").get('rows', [])
         if meta_rows:
             desc = meta_rows[0][1]
-            db.run("?[concept] <- $data\n:rm concept_metadata {concept}", {"data": [[old_name]]})
-            db.run("?[concept, description] <- $data\n:put concept_metadata {concept => description}", {"data": [[new_name, desc]]})
+            run_query(db, "?[concept] <- $data\n:rm concept_metadata {concept}", {"data": [[old_name]]})
+            run_query(db, "?[concept, description] <- $data\n:put concept_metadata {concept => description}", {"data": [[new_name, desc]]})
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
 
 # ── Q&A ───────────────────────────────────────────────────────
-
-QUERY_PROMPT = """You are a CozoDB Datalog expert assistant. The database has two relations:
-  *eav[entity: String, attribute: String, value: String, confidence: Float, source: String, is_bind: Bool]
-  *concept_metadata[concept: String, description: String]
-
-Common attributes: afecta_a, generado_por, compuesto_por, propuesto_por, es_un, requiere_de,
-  es_instancia_de, afecta_indirectamente_a.
-
-Given the user's question, write ONE single valid CozoDB Datalog query that answers it.
-Return ONLY the raw Datalog query, no explanations, no markdown fences.
+QUERY_PROMPT = """RULES:
+1. Start EVERY line with: ?[attr, val] :=
+2. NEVER use other variables in the head. Always ?[attr, val].
+3. Use multiple rules for OR logic.
+4. Strings in "Double Quotes".
 
 Examples:
-Q: ¿Qué conceptos afectan a la Gravedad?
-A: ?[e] := *eav[e, "afecta_a", "Gravedad", _, _, _]
+Q: Qué conceptos afectan a la Gravedad?
+A: ?[attr, val] := *eav[val, attr, "Gravedad", _, _, _], attr = "afecta_a"
 
-Q: ¿Qué es la Mecánica Cuántica?
-A: ?[d] := *concept_metadata["Mecánica Cuántica", d]
+Q: Qué sabes de Einstein?
+A: 
+?[attr, val] := *eav["Einstein", attr, val, _, _, _]
+?[attr, val] := *eav[ent, attr, "Einstein", _, _, _], val = ent
+?[attr, val] := *concept_metadata["Einstein", val], attr = "description"
+
+Q: Qué es la Mecánica Cuántica?
+A: ?[attr, val] := *concept_metadata["Mecánica Cuántica", val], attr = "description"
 
 User question: {question}"""
 
-ANSWER_PROMPT = """You are a scientific assistant. Answer the question in Spanish using ONLY the data provided.
-If data is empty or error, say you don't have enough information. Be concise (2-4 sentences).
-Question: {question}
-Data from database: {data}"""
+HYBRID_PROMPT = """Eres un asistente científico experto. 
+Debes responder a la pregunta del usuario utilizando dos fuentes de información:
+1. DATOS ESTRUCTURADOS (del Grafo de Conocimiento): {data_db}
+2. CONTEXTO NARRATIVO (del Wiki Markdown): {data_wiki}
+
+Tu objetivo es ser preciso y explicativo. Si hay contradicciones, prioriza los datos estructurados, pero usa el Wiki para dar profundidad. 
+Cita las fuentes (Wiki o Grafo) si es posible. Responde en español.
+
+Pregunta: {question}"""
 
 
 @app.route('/api/models')
@@ -421,31 +459,81 @@ def api_ask():
     data = request.json or {}
     question = data.get('question', '').strip()
     onto_name = data.get('onto')
-    model = data.get('model') or None  # per-request model override
+    model = data.get('model') or None
+    mode = data.get('mode', 'datalog') # 'datalog' or 'wiki'
+
     if not question:
         return jsonify({"error": "No question provided."})
-    # Step 1: generate Datalog query
-    raw_query = call_ollama(QUERY_PROMPT.format(question=question), model=model)
-    raw_query = raw_query.replace("```datalog", "").replace("```", "").strip()
-    # Step 2: run on CozoDB
-    db_results, query_error = [], None
-    try:
-        db = get_db(onto_name)
-        res = db.run(raw_query)
-        db_results = res.get('rows', [])
-    except Exception as ex:
-        query_error = str(ex)
-    # Step 3: format answer in NL
-    data_str = str(db_results) if db_results else (f"Query error: {query_error}" if query_error else "(vacío)")
-    natural_answer = call_ollama(ANSWER_PROMPT.format(question=question, data=data_str), model=model)
-    return jsonify({
-        "question": question,
-        "generated_query": raw_query,
-        "raw_results": db_results,
-        "answer": natural_answer,
-        "query_error": query_error,
-        "model_used": model or OLLAMA_MODEL
-    })
+
+    context_wiki = ""
+    res_db = []
+    
+    # ── SHARED STRATEGIES ──────────────────────────────────────
+    def get_wiki_context(q, onto_n, mdl):
+        onto = get_ontology(onto_n)
+        if not onto: return ""
+        wm = WikiManager(os.path.dirname(onto["db_path"]))
+        idx = ""
+        if os.path.exists(wm.index_path):
+            with open(wm.index_path, "r", encoding="utf-8") as f: idx = f.read()
+        sp = f"Índice del wiki:\n{idx}\nPregunta: {q}\nResponde SOLO los nombres de las 3 páginas más relevantes separadas por comas."
+        pages = call_ollama(sp, model=mdl).split(",")
+        ctx = ""
+        for p in pages:
+            c, _ = wm.read_page(p.strip().replace("[[", "").replace("]]", ""))
+            if c: ctx += f"--- Wiki: {p.strip()} ---\n{c}\n\n"
+        return ctx
+
+    def get_db_results(q, onto_n, mdl):
+        raw_r = call_ollama(QUERY_PROMPT.format(question=q), model=mdl)
+        # Clean query (reuse the logic from before)
+        lines = raw_r.split("\n")
+        query_lines = []
+        started = False
+        for l in lines:
+            l_strip = l.strip()
+            if l_strip.startswith("?"): started = True
+            if started:
+                if any(c in l_strip for c in (':=', '*', '[', '|', ']', ',')): query_lines.append(l)
+                elif len(l_strip.split()) > 3 and l_strip[0].isupper(): break
+                else: break
+        q_final = "\n".join(query_lines).strip()
+        try:
+            db = get_db(onto_n)
+            return run_query(db, q_final).get('rows', []), q_final
+        except Exception as e:
+            return [], str(e)
+
+    # ── MODES ──────────────────────────────────────────────────
+    if mode == 'wiki':
+        context_wiki = get_wiki_context(question, onto_name, model)
+        final_prompt = f"Responde basándote solo en el Wiki:\nContexto:\n{context_wiki}\nPregunta: {question}"
+        answer = call_ollama(final_prompt, model=model)
+        return jsonify({"answer": answer, "mode": "wiki", "question": question})
+
+    elif mode == 'datalog':
+        res_db, q_run = get_db_results(question, onto_name, model)
+        ans = call_ollama(f"Responde basándote en estos datos: {res_db}\nPregunta: {question}", model=model)
+        return jsonify({"answer": ans, "mode": "datalog", "query": q_run, "question": question})
+
+    elif mode == 'hybrid':
+        context_wiki = get_wiki_context(question, onto_name, model)
+        res_db, q_run = get_db_results(question, onto_name, model)
+        
+        final_p = HYBRID_PROMPT.format(
+            question=question, 
+            data_db=str(res_db), 
+            data_wiki=context_wiki
+        )
+        answer = call_ollama(final_p, model=model)
+        
+        return jsonify({
+            "answer": answer,
+            "mode": "hybrid",
+            "query": q_run,
+            "db_facts": len(res_db),
+            "question": question
+        })
 
 
 # ── REVIEWS ───────────────────────────────────────────────────
@@ -455,7 +543,7 @@ def api_pending_reviews():
     onto_name = _get_onto_name_from_request()
     try:
         db = get_db(onto_name)
-        res = db.run("?[id, oe, oa, ov, ne, na, nv, reason] := *pending_review[id, oe, oa, ov, ne, na, nv, reason]")
+        res = run_query(db, "?[id, oe, oa, ov, ne, na, nv, reason] := *pending_review[id, oe, oa, ov, ne, na, nv, reason]")
         rows = res.get('rows', [])
         return jsonify([{"id": r[0], "old_entity": r[1], "old_attr": r[2], "old_val": r[3],
                          "new_entity": r[4], "new_attr": r[5], "new_val": r[6], "reason": r[7]} for r in rows])
@@ -473,16 +561,17 @@ def api_approve_review():
         return jsonify({"status": "error", "msg": "Invalid params"})
     try:
         db = get_db(onto_name)
-        res = db.run("?[id, oe, oa, ov, ne, na, nv, r] := *pending_review[id, oe, oa, ov, ne, na, nv, r], id=$id", {"id": review_id})
+        res = run_query(db, "?[id, oe, oa, ov, ne, na, nv, r] := *pending_review[id, oe, oa, ov, ne, na, nv, r], id=$id", {"id": review_id})
         rows = res.get('rows', [])
         if not rows:
             return jsonify({"status": "error", "msg": "Review not found"})
         r = rows[0]
         if action == 'approve':
-            db.run("?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}", {"data": [[r[1], r[2], r[3]]]})
-            db.run("?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}",
-                   {"data": [[r[4], r[5], r[6], 1.0, 'llm_reviewer', False]]})
-        db.run("?[id] <- $data\n:rm pending_review {id}", {"data": [[review_id]]})
+            run_query(db, "?[entity, attribute, value] <- $data\n:rm eav {entity, attribute, value}", {"data": [[r[1], r[2], r[3]]]})
+            if r[4] != 'DELETE':
+                run_query(db, "?[entity, attribute, value, confidence, source, is_bind] <- $data\n:put eav {entity, attribute, value => confidence, source, is_bind}",
+                       {"data": [[r[4], r[5], r[6], 1.0, 'llm_reviewer', False]]})
+        run_query(db, "?[id] <- $data\n:rm pending_review {id}", {"data": [[review_id]]})
         return jsonify({"status": "ok"})
     except Exception as ex:
         return jsonify({"status": "error", "msg": str(ex)})
@@ -509,7 +598,7 @@ def api_path():
         
         db = get_db(onto_name)
         # 1. Fetch all facts from the ontology (fast for manageable datasets)
-        res = db.run("?[s, a, d] := *eav[s, a, d, _, _, _]")
+        res = run_query(db, "?[s, a, d] := *eav[s, a, d, _, _, _]")
         facts = res.get('rows', [])
         
         # 2. Build adjacency list (bi-directional)
