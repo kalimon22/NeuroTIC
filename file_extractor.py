@@ -147,7 +147,10 @@ def parse_csv_to_facts(raw_csv, source_tag):
             if not row:
                 continue
             row = [x.strip() for x in row]
-            if i == 0 and "Entidad" in row[0]:
+            
+            # Robust header skipping (Spanish and English)
+            header_keywords = ["entidad", "entity", "atributo", "attribute", "valor", "value", "confianza", "confidence", "header"]
+            if any(key in row[0].lower() for key in header_keywords):
                 continue
             if len(row) >= 4:
                 entity, attr, value, conf_str = row[0], row[1], row[2], row[3]

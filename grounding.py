@@ -61,7 +61,7 @@ REGLAS ESTRICTAS DE JSON:
 
 Esquema obligatorio:
 {{
-   "descripcion": "<texto extenso en formato markdown, usa '\\n\\n' para separar párrafos. Si no hay info, di 'Sin información en el texto'>",
+   "descripcion": "<texto extenso en formato markdown. Si realmente no hay información en el texto proporcionado, indica 'No se encontró información suficiente en el documento.'>",
    "instancias": ["ejemplo 1", "ejemplo 2"]
 }}
 """
@@ -280,6 +280,10 @@ def main():
                     items = [x.strip() for x in inst_raw.split(";") if x.strip()]
                     for inst in items:
                         inst_name = inst.title()
+                        # Filtro de seguridad: No crear conceptos a partir de frases de error del LLM
+                        if any(x in inst_name.lower() for x in ["sin información", "no hay", "desconocido", "n/a", "no se encontró"]):
+                            continue
+                            
                         # Marcamos como grounding_agent
                         hechos.append([inst_name, "es_instancia_de", concept, 1.0, "grounding_agent", False])
                         # Y también le asignamos las fuentes originales del archivo para mantener el hilo

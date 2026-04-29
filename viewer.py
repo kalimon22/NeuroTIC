@@ -404,10 +404,26 @@ QUERY_PROMPT = """RULES:
 2. NEVER use other variables in the head. Always ?[attr, val].
 3. Use multiple rules for OR logic.
 4. Strings in "Double Quotes".
+5. IMPORTANT: Concepts in the database are ALWAYS in Title Case (e.g., "Gravedad", "Imagen Institucional"). 
+   Even if the user writes in lowercase, you MUST use Title Case in the query.
+6. ONLY USE THESE TABLES:
+   - *eav[entity, attribute, value, confidence, source, is_bind]
+   - *concept_metadata[concept, description]
+   DO NOT invent other tables like 'legislation', 'laws', etc. Use attributes like "regula" or "establece" within the *eav table.
 
 Examples:
 Q: Qué conceptos afectan a la Gravedad?
 A: ?[attr, val] := *eav[val, attr, "Gravedad", _, _, _], attr = "afecta_a"
+
+Q: qué sabes sobre la imagen institucional?
+A: 
+?[attr, val] := *eav["Imagen Institucional", attr, val, _, _, _]
+?[attr, val] := *eav[ent, attr, "Imagen Institucional", _, _, _], val = ent
+?[attr, val] := *concept_metadata["Imagen Institucional", val], attr = "description"
+
+Q: Qué leyes regulan las Cajas de Ahorros?
+A: ?[attr, val] := *eav["Cajas De Ahorros", attr, val, _, _, _], attr = "regulado_por"
+?[attr, val] := *eav[ent, "regula", "Cajas De Ahorros", _, _, _], val = ent
 
 Q: Qué sabes de Einstein?
 A: 
